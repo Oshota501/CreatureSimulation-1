@@ -5,7 +5,7 @@
 - 生きているだけ・泳ぐだけでエネルギーが減り、植物や肉を食べると増える
 - エネルギーが十分たまったら子を産む。子は親の遺伝子を少しだけ突然変異させて受け継ぐ
 - エネルギーが尽きる・体力が尽きる（噛まれて殺される）・寿命が来ると死に、体重に応じた肉（死体）が残る
-- 個体数が下限を割ったら、これまでで一番食べた個体（殿堂入り）の変異コピーを補充する
+- 個体数が減っても自動では補充しない（表示画面でマウスから生き物を置ける）
 
 体のつくり
 - 尾びれ: 左右に振ると前に進む（生まれつきの遊泳リズム＋脳で制御）
@@ -174,17 +174,16 @@ class EvoConfig:
     world_h: float = 240.0
     max_creatures: int = 2048      # 同時に存在できる最大数（GPU 上の枠の数）
     init_creatures: int = 30
-    min_creatures: int = 20        # これを下回ったら殿堂入り個体から補充
-    hall_size: int = 64
     max_births_per_step: int = 64
     # 植物
-    max_food: int = 1200           # 最初は満杯（エデンの園）
+    max_food: int = 2000           # 植物の枠の数（手で撒ける上限）
+    plant_capacity: int = 1200     # 自然に生える上限。最初はここまで生えている（エデンの園）
     food_energy: float = 25.0
     food_radius: float = 0.8
-    food_regrow: float = 0.003     # 空いている植物の枠1つにつき、1ステップで植物が生える確率
-    n_hotspots: int = 3            # 植物がよく生える場所
-    hotspot_sigma: float = 24.0
-    hotspot_frac: float = 0.7
+    food_regrow: float = 0.003     # 生える速さ: 1ステップに (上限 - 今の数) × これ だけ生える
+    n_hotspots: int = 3            # 植物がよく生える場所（最初の数。あとから置いたり消したりできる）
+    hotspot_sigma: float = 24.0    # よく生える場所の広さ（最初の値）
+    hotspot_frac: float = 0.7      # 生える植物のうち、よく生える場所に生える割合
     # 肉（死体）
     max_meat: int = 512
     meat_per_mass: float = 60.0    # 死体のエネルギー = これ × 体重（大きい個体ほどごちそう）
@@ -275,18 +274,15 @@ class World:
         self.next_id = torch.zeros((), dtype=torch.long, device=dev)
         # 植物
         self.hotspots = torch.rand(c.n_hotspots, 2, device=dev) * self.world_size
+        self.hotspot_r = torch.full((c.n_hotspots,), c.hotspot_sigma, device=dev)
         self.food_pos = self._sample_food_pos(M)
-        self.food_alive = torch.ones(M, dtype=torch.bool, device=dev)
+        self.food_alive = torch.arange(M, device=dev) < c.plant_capacity
         # 肉（死体）
         self.meat_pos, self.meat_energy = zf(MM, 2), zf(MM)
         self.meat_alive = torch.zeros(MM, dtype=torch.bool, device=dev)
-        # 殿堂入り（死んだ個体のうち、一生で食べた量が多かったもの）
-        self.hall_genes = zf(c.hall_size, self.n_genes)
-        self.hall_score = torch.full((c.hall_size,), -1.0, device=dev)
-        self.hall_root, self.hall_gen = zl(c.hall_size), zl(c.hall_size)
 
         self.steps = 0
-        self.totals = {k: torch.zeros((), device=dev) for k in ("births", "deaths", "eaten", "kills", "injected")}
+        self.totals = {k: torch.zeros((), device=dev) for k in ("births", "deaths", "eaten", "kills", "spawned")}
 
         n = c.init_creatures
         genes = self.random_genes(n)
@@ -399,49 +395,92 @@ class World:
         self.meat_energy[slots] = torch.where(valid, energy, self.meat_energy[slots])
         self.meat_alive[slots] = self.meat_alive[slots] | valid
 
-    def _update_hall(self, dying):
-        """死んだ個体のうち成績の良いものを殿堂入りリストに残す"""
-        Hs = self.cfg.hall_size
-        score = torch.where(dying, self.food_eaten + 0.5 * self.children, -1.0)
-        top_s, top_i = torch.cat([self.hall_score, score]).topk(Hs)
-        from_hall = top_i < Hs
-        hi, ci = top_i.clamp(max=Hs - 1), (top_i - Hs).clamp(min=0)
-        self.hall_genes = torch.where(from_hall[:, None], self.hall_genes[hi], self.genes[ci])
-        self.hall_root = torch.where(from_hall, self.hall_root[hi], self.root[ci])
-        self.hall_gen = torch.where(from_hall, self.hall_gen[hi], self.generation[ci])
-        self.hall_score = top_s
-
-    def _maintain_population(self):
-        """個体数が下限を割ったら補充する（序盤の補助輪）"""
-        c = self.cfg
-        n_alive = int(self.alive.sum())
-        if n_alive >= c.min_creatures:
-            return
-        n = c.min_creatures - n_alive + c.min_creatures // 2
+    def spawn_at(self, x, y, n=1, radius=0.0, parent_slot=None):
+        """(x, y) の周り radius 以内に生き物を n 匹置く（表示画面のマウス操作から呼ぶ）。
+        parent_slot を指定するとその個体の子（突然変異した遺伝子・同じ家族）、なければ完全にランダムな個体"""
         slots = torch.nonzero(~self.alive).squeeze(1)[:n]
         n = slots.shape[0]
-        good = self.hall_score > 0
-        use_hall = good.any() & (torch.rand(n, device=self.device) < 0.8)
-        pick = torch.multinomial(good.float() + 1e-6, n, replacement=True)
-        genes = torch.where(use_hall[:, None], self.mutate(self.hall_genes[pick]), self.random_genes(n))
+        if n == 0:
+            return 0
+        dev = self.device
+        minus1 = torch.full((n,), -1, dtype=torch.long, device=dev)
+        if parent_slot is not None and bool(self.alive[parent_slot]):
+            p = torch.full((n,), parent_slot, dtype=torch.long, device=dev)
+            genes = self.mutate(self.genes[p])
+            generation, root, parent = self.generation[p] + 1, self.root[p], self.cid[p]
+        else:
+            genes = self.random_genes(n)
+            generation, root, parent = torch.zeros(n, dtype=torch.long, device=dev), minus1, minus1
+        r = radius * torch.rand(n, device=dev).sqrt()
+        a = torch.rand(n, device=dev) * 2 * math.pi
+        pos = torch.remainder(torch.stack([x + r * torch.cos(a), y + r * torch.sin(a)], -1), self.world_size)
         bd = self.body(self.traits(genes))
-        minus1 = torch.full((n,), -1, dtype=torch.long, device=self.device)
-        self._spawn(slots, torch.ones(n, dtype=torch.bool, device=self.device), genes,
-                    pos=torch.rand(n, 2, device=self.device) * self.world_size,
-                    theta=(torch.rand(n, device=self.device) * 2 - 1) * math.pi,
-                    energy=0.6 * bd["emax"], hp=bd["hp_max"],
-                    generation=torch.where(use_hall, self.hall_gen[pick], 0),
-                    root=torch.where(use_hall, self.hall_root[pick], minus1), parent=minus1)
-        self.totals["injected"] += n
+        self._spawn(slots, torch.ones(n, dtype=torch.bool, device=dev), genes, pos=pos,
+                    theta=(torch.rand(n, device=dev) * 2 - 1) * math.pi, energy=0.6 * bd["emax"], hp=bd["hp_max"],
+                    generation=generation, root=root, parent=parent)
+        self.totals["spawned"] += n
+        return n
 
     # ================================================================ 植物
     def _sample_food_pos(self, n):
         c = self.cfg
-        k = torch.randint(0, c.n_hotspots, (n,), device=self.device)
-        near = self.hotspots[k] + torch.randn(n, 2, device=self.device) * c.hotspot_sigma
         anywhere = torch.rand(n, 2, device=self.device) * self.world_size
+        K = self.hotspots.shape[0]
+        if K == 0:  # よく生える場所がなければ、どこにでも均等に生える
+            return anywhere
+        k = torch.randint(0, K, (n,), device=self.device)
+        near = self.hotspots[k] + torch.randn(n, 2, device=self.device) * self.hotspot_r[k, None]
         use_hot = torch.rand(n, 1, device=self.device) < c.hotspot_frac
         return torch.remainder(torch.where(use_hot, near, anywhere), self.world_size)
+
+    # ---- 植物を手で操作する（表示画面から呼ぶ）
+    def _wrapped_dist(self, pts, x, y):
+        d = torch.remainder(pts - torch.tensor([x, y], device=self.device) + self.world_size / 2,
+                            self.world_size) - self.world_size / 2
+        return d.norm(dim=-1)
+
+    def _place_food(self, pos):
+        free = torch.nonzero(~self.food_alive).squeeze(1)[: len(pos)]
+        self.food_pos[free] = pos[: len(free)]
+        self.food_alive[free] = True
+        return len(free)
+
+    def add_food(self, x, y, radius, n):
+        """(x, y) の周り radius 以内に植物を n 個撒く（枠が空いている分だけ）"""
+        r = radius * torch.rand(n, device=self.device).sqrt()
+        a = torch.rand(n, device=self.device) * 2 * math.pi
+        pos = torch.stack([x + r * torch.cos(a), y + r * torch.sin(a)], -1)
+        return self._place_food(torch.remainder(pos, self.world_size))
+
+    def remove_food(self, x, y, radius):
+        """(x, y) の周り radius 以内の植物を消す"""
+        self.food_alive &= self._wrapped_dist(self.food_pos, x, y) >= radius
+
+    def food_rain(self, n=300):
+        """よく生える場所の分布に従って、植物をまとめて n 個撒く"""
+        return self._place_food(self._sample_food_pos(n))
+
+    def clear_food(self):
+        self.food_alive[:] = False
+
+    def add_hotspot(self, x, y, radius):
+        self.hotspots = torch.cat([self.hotspots, torch.tensor([[x, y]], device=self.device)])
+        self.hotspot_r = torch.cat([self.hotspot_r, torch.tensor([radius], device=self.device)])
+
+    def move_hotspot(self, i, x, y):
+        self.hotspots[i] = torch.tensor([x, y], device=self.device) % self.world_size
+
+    def remove_hotspot(self, i):
+        keep = torch.arange(self.hotspots.shape[0], device=self.device) != i
+        self.hotspots, self.hotspot_r = self.hotspots[keep], self.hotspot_r[keep]
+
+    def hotspot_at(self, x, y):
+        """(x, y) が中心付近にある「よく生える場所」の番号（なければ None）"""
+        if self.hotspots.shape[0] == 0:
+            return None
+        d = self._wrapped_dist(self.hotspots, x, y)
+        i = int(torch.argmin(d))
+        return i if float(d[i]) < max(4.0, 0.5 * float(self.hotspot_r[i])) else None
 
     def meat_radius(self):
         return 0.5 + 0.12 * self.meat_energy.clamp(min=0).sqrt()
@@ -569,7 +608,6 @@ class World:
         dying = alive & ((self.energy <= 0) | (self.age > c.max_age) | (self.hp <= 0))
         killed = dying & (self.hp <= 0)
         self.kills = self.kills + (bites & killed[victim]).long()
-        self._update_hall(dying)
         self._leave_corpses(dying, bd)
         self.alive = alive & ~dying
         self.totals["deaths"] += dying.sum()
@@ -579,15 +617,15 @@ class World:
         self._births(tr, bd)
 
         # ---- 植物が生える・肉が腐る
-        grow = ~self.food_alive & (torch.rand(len(self.food_alive), device=self.device) < c.food_regrow)
+        empty = ~self.food_alive
+        n_new = c.food_regrow * (c.plant_capacity - self.food_alive.sum()).clamp(min=0)   # 上限に近いほどゆっくり
+        grow = empty & (torch.rand(len(empty), device=self.device) < n_new / empty.sum().clamp(min=1))
         self.food_pos = torch.where(grow[:, None], self._sample_food_pos(len(grow)), self.food_pos)
         self.food_alive = self.food_alive | grow
         self.meat_energy = self.meat_energy * (1 - c.meat_decay)
         self.meat_alive = self.meat_alive & (self.meat_energy > 1.0)
 
         self.steps += 1
-        if self.steps % 25 == 0:
-            self._maintain_population()
 
     # ================================================================ 表示・記録用
     def summary(self):
@@ -643,8 +681,8 @@ class World:
 
     STATE_KEYS = ("alive", "genes", "pos", "vel", "theta", "omega", "tail", "tail_vel", "fin_act", "bite_act",
                   "phase", "hidden", "energy", "hp", "age", "generation", "food_eaten", "children", "kills", "cid",
-                  "root", "parent", "next_id", "hotspots", "food_pos", "food_alive", "meat_pos", "meat_energy",
-                  "meat_alive", "hall_genes", "hall_score", "hall_root", "hall_gen")
+                  "root", "parent", "next_id", "hotspots", "hotspot_r", "food_pos", "food_alive", "meat_pos",
+                  "meat_energy", "meat_alive")
 
     def save(self, path):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -659,9 +697,15 @@ class World:
         data = torch.load(path, map_location="cpu", weights_only=True)
         if data.get("version") != SAVE_VERSION:
             raise ValueError(f"{path} は古い形式（今の体のつくりより前）の保存ファイルなので読み込めません")
-        world = cls(EvoConfig(**data["cfg"]), device)
+        known = EvoConfig.__dataclass_fields__   # 今はもう無い設定項目（古い保存ファイル）は無視する
+        world = cls(EvoConfig(**{k: v for k, v in data["cfg"].items() if k in known}), device)
         for k in cls.STATE_KEYS:
-            setattr(world, k, data[k].to(world.device))
+            if k in data:  # 古い保存ファイルに無い項目は初期値のまま
+                setattr(world, k, data[k].to(world.device))
+        if "hotspot_r" not in data:
+            world.hotspot_r = torch.full((world.hotspots.shape[0],), world.cfg.hotspot_sigma, device=world.device)
         world.steps = data["steps"]
-        world.totals = {k: torch.tensor(v, device=world.device) for k, v in data["totals"].items()}
+        for k, v in data["totals"].items():
+            if k in world.totals:
+                world.totals[k] = torch.tensor(v, device=world.device)
         return world

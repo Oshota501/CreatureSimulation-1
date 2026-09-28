@@ -35,6 +35,13 @@ TRAIT_LABELS = {
 }
 MEAT, MEAT_EDGE = (150, 40, 40), (90, 20, 25)
 HERB_COL, CARN_COL, PLANT_COL = (255, 200, 90), (255, 90, 90), (90, 200, 90)
+# 植物を操作するツール
+TOOLBAR_H = 40
+TOOLS = [("select", "1 select"), ("feed", "2 feed"), ("erase", "3 erase"), ("hotspot", "4 spot"), ("spawn", "5 spawn")]
+TOOL_COLORS = {"select": ACCENT, "feed": (120, 255, 120), "erase": (255, 110, 110), "hotspot": (90, 220, 200),
+               "spawn": (255, 200, 90)}
+GROWTH_LEVELS = [0, 0.25, 0.5, 1, 2, 4, 8]   # 生える速さ（最初の設定の何倍か）
+DEFAULT_REGROW = EvoConfig().food_regrow
 BODY_TRAITS = [name for name, _, _ in TRAITS if not name.startswith("fin")]
 TRAIT_RANGE = {name: (lo, hi) for name, lo, hi in TRAITS}
 TRAIT_INDEX = {name: i for i, (name, _, _) in enumerate(TRAITS)}
@@ -299,6 +306,15 @@ class Viewer:
         self.sps, self._sps_t, self._sps_steps = 0.0, time.time(), world.steps
         self.food_sprites = {}
         self.info = None
+        # 植物の操作
+        self.tool = "select"
+        self.brush = 20.0
+        self.painting = False
+        self.drag_hotspot = None
+        self.spawn_timer = 0
+        self.buttons = []
+        ratio = self.cfg.food_regrow / DEFAULT_REGROW
+        self.growth_i = int(np.argmin([abs(g - ratio) for g in GROWTH_LEVELS]))
 
     # ------------------------------------------------------------ カメラ
     def reset_camera(self):
@@ -315,6 +331,78 @@ class Viewer:
 
     def flash(self, msg):
         self.message, self.message_t = msg, 150
+
+    def screen_to_world(self, sx, sy):
+        x = self.cam[0] + (sx - VIEW_W / 2) / self.zoom
+        y = self.cam[1] + (VIEW_H / 2 - sy) / self.zoom
+        return float(x % self.cfg.world_w), float(y % self.cfg.world_h)
+
+    def in_world(self, pos):
+        return pos[0] < VIEW_W and pos[1] < VIEW_H - TOOLBAR_H
+
+    # ------------------------------------------------------------ 植物の操作
+    def set_tool(self, tool):
+        self.tool = tool
+        self.painting, self.drag_hotspot = False, None
+
+    def set_growth(self, i):
+        self.growth_i = int(np.clip(i, 0, len(GROWTH_LEVELS) - 1))
+        self.cfg.food_regrow = DEFAULT_REGROW * GROWTH_LEVELS[self.growth_i]
+
+    def set_capacity(self, n):
+        self.cfg.plant_capacity = int(np.clip(n, 0, self.cfg.max_food))
+
+    def set_brush(self, r):
+        self.brush = float(np.clip(r, 3, 80))
+
+    def rain(self):
+        self.flash(f"food rain  +{self.world.food_rain(300)}")
+
+    def clear_plants(self):
+        self.world.clear_food()
+        self.flash("all plants cleared")
+
+    def spawn_here(self, n):
+        """マウスの位置に生き物を置く。選択中の個体がいればその子、いなければランダムな個体"""
+        mx, my = pygame.mouse.get_pos()
+        if not self.in_world((mx, my)):
+            return
+        x, y = self.screen_to_world(mx, my)
+        parent = self.selected if self.info is not None else None
+        if self.world.spawn_at(x, y, n, self.brush if n > 1 else 0.0, parent) == 0:
+            self.flash("no free slots (too many creatures)")
+
+    def click_world(self, mx, my):
+        if self.tool == "spawn":
+            self.spawn_here(10 if pygame.key.get_mods() & pygame.KMOD_SHIFT else 1)
+            self.painting, self.spawn_timer = True, 0   # 押し続けると少しずつ置き続ける
+        elif self.tool == "select":
+            self.select_at(mx, my)
+        elif self.tool in ("feed", "erase"):
+            self.painting = True
+            self.apply_brush()
+        elif self.tool == "hotspot":
+            x, y = self.screen_to_world(mx, my)
+            i = self.world.hotspot_at(x, y)
+            if i is None:  # 何もない所をクリック → 新しく置く。置いたあとそのままドラッグで動かせる
+                self.world.add_hotspot(x, y, self.brush)
+                i = self.world.hotspots.shape[0] - 1
+            self.drag_hotspot = i
+
+    def apply_brush(self):
+        """マウスを押している間、ブラシの範囲に植物を撒く / 消す"""
+        mx, my = pygame.mouse.get_pos()
+        if not self.in_world((mx, my)):
+            return
+        x, y = self.screen_to_world(mx, my)
+        if self.tool == "feed":
+            self.world.add_food(x, y, self.brush, max(2, int(self.brush * 0.3)))
+        elif self.tool == "erase":
+            self.world.remove_food(x, y, self.brush)
+        elif self.tool == "spawn":
+            self.spawn_timer += 1
+            if self.spawn_timer % 8 == 0:
+                self.spawn_here(1)
 
     # ------------------------------------------------------------ 入力
     def handle(self, event):
@@ -338,8 +426,17 @@ class Viewer:
             elif k == pygame.K_h:
                 self.show_hotspots = not self.show_hotspots
             elif k == pygame.K_r:
-                self.world.food_alive[:] = True
-                self.flash("food rain!")
+                self.rain()
+            elif k in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5):
+                self.set_tool(TOOLS[k - pygame.K_1][0])
+            elif k == pygame.K_LEFTBRACKET:
+                self.set_brush(self.brush / 1.25)
+            elif k == pygame.K_RIGHTBRACKET:
+                self.set_brush(self.brush * 1.25)
+            elif k == pygame.K_COMMA:
+                self.set_growth(self.growth_i - 1)
+            elif k == pygame.K_PERIOD:
+                self.set_growth(self.growth_i + 1)
             elif k == pygame.K_s:
                 self.world.save(self.args.save)
                 self.flash(f"saved: {self.args.save}")
@@ -352,12 +449,28 @@ class Viewer:
                 if not self.follow:
                     self.cam += before - after
         elif event.type == pygame.MOUSEBUTTONDOWN:
-            if event.button in (2, 3):
+            if event.button == 1:
+                for rect, action in self.buttons:
+                    if rect.collidepoint(event.pos):
+                        action()
+                        return True
+                if self.in_world(event.pos):
+                    self.click_world(*event.pos)
+            elif event.button in (2, 3):
+                if self.tool == "hotspot" and self.in_world(event.pos):
+                    i = self.world.hotspot_at(*self.screen_to_world(*event.pos))
+                    if i is not None:  # 「よく生える場所」の上で右クリック → 消す
+                        self.world.remove_hotspot(i)
+                        self.flash("hotspot removed")
+                        return True
                 self.dragging = event.pos
-            elif event.button == 1 and event.pos[0] < VIEW_W:
-                self.select_at(*event.pos)
-        elif event.type == pygame.MOUSEBUTTONUP and event.button in (2, 3):
-            self.dragging = None
+        elif event.type == pygame.MOUSEBUTTONUP:
+            if event.button in (2, 3):
+                self.dragging = None
+            elif event.button == 1:
+                self.painting, self.drag_hotspot = False, None
+        elif event.type == pygame.MOUSEMOTION and self.drag_hotspot is not None:
+            self.world.move_hotspot(self.drag_hotspot, *self.screen_to_world(*event.pos))
         elif event.type == pygame.MOUSEMOTION and self.dragging:
             dx, dy = event.pos[0] - self.dragging[0], event.pos[1] - self.dragging[1]
             self.cam += np.array([-dx / self.zoom, dy / self.zoom])
@@ -442,14 +555,15 @@ class Viewer:
         ov.fill((0, 0, 0, 0))
         W, H = self.cfg.world_w, self.cfg.world_h
 
-        if self.show_hotspots:
-            for hx, hy in self.world.hotspots.cpu().double().numpy():
+        if self.show_hotspots or self.tool == "hotspot":
+            spots = torch.cat([self.world.hotspots, self.world.hotspot_r[:, None]], 1).cpu().double().numpy()
+            for hx, hy, hr in spots:
                 dx, dy = self.wrap_rel(hx, hy)
                 for ox in (-W, 0, W):
                     for oy in (-H, 0, H):
                         c = self.to_screen(dx + ox, dy + oy)
                         for k, a in ((1.6, 10), (1.0, 12), (0.5, 14)):
-                            pygame.draw.circle(ov, (60, 200, 110, a), c, self.cfg.hotspot_sigma * k * self.zoom)
+                            pygame.draw.circle(ov, (60, 200, 110, a), c, hr * k * self.zoom)
 
         # 境界線（つながっている世界の継ぎ目）
         x0, y0 = self.to_screen(*self.wrap_rel(0.0, 0.0))
@@ -484,6 +598,8 @@ class Viewer:
 
         # 生き物
         if not len(p["slot"]):
+            t = self.font_big.render("no creatures left  -  press 5 and click to add some", True, TOOL_COLORS["spawn"])
+            self.screen.blit(t, t.get_rect(center=(VIEW_W // 2, VIEW_H // 2)))
             return
         sx, sy = self.to_screen(p["dx"], p["dy"])
         margin = 15 * self.zoom
@@ -495,6 +611,66 @@ class Viewer:
             c = self.to_screen(p["dx"][sel], p["dy"][sel])
             r = 3.5 * p["size"][sel] * p["body_len"][sel] * self.zoom + 6
             pygame.draw.circle(self.screen, (255, 255, 255), c, r, 2)
+
+    def draw_toolbar(self):
+        """画面下のツールバー: ツールの切り替えと、植物の生え方の調整"""
+        y0 = VIEW_H - TOOLBAR_H
+        # ブラシの範囲と「よく生える場所」の中心
+        mx, my = pygame.mouse.get_pos()
+        if self.tool == "hotspot":
+            for hx, hy in self.world.hotspots.cpu().double().numpy():
+                c = self.to_screen(*self.wrap_rel(hx, hy))
+                hover = self.world.hotspot_at(*self.screen_to_world(mx, my)) is not None and \
+                    math.hypot(c[0] - mx, c[1] - my) < 40
+                pygame.draw.circle(self.screen, (255, 255, 255) if hover else TOOL_COLORS["hotspot"], c, 7, 2)
+                pygame.draw.circle(self.screen, TOOL_COLORS["hotspot"], c, 3)
+        if self.tool != "select" and self.in_world((mx, my)):
+            pygame.draw.circle(self.screen, TOOL_COLORS[self.tool], (mx, my), max(3, self.brush * self.zoom), 1)
+        if self.tool == "spawn" and self.in_world((mx, my)):
+            what = f"child of #{self.info['id']}" if self.info is not None else "random creature"
+            t = self.font.render(what + "  (shift: x10)", True, TOOL_COLORS["spawn"])
+            self.screen.blit(t, (mx + 14, my + 10))
+
+        bar = pygame.Surface((VIEW_W, TOOLBAR_H), pygame.SRCALPHA)
+        bar.fill((8, 12, 22, 220))
+        self.screen.blit(bar, (0, y0))
+        self.buttons = []
+        x, y, h = 8, y0 + 7, TOOLBAR_H - 14
+        for key, label in TOOLS:
+            x = self.button(x, y, 68, h, label, lambda k=key: self.set_tool(k),
+                            active=self.tool == key, color=TOOL_COLORS[key])
+        x += 12
+        g = GROWTH_LEVELS[self.growth_i]
+        x = self.stepper(x, y, h, "grow", "OFF" if g == 0 else f"x{g:g}",
+                         lambda: self.set_growth(self.growth_i - 1), lambda: self.set_growth(self.growth_i + 1))
+        cap = self.cfg.plant_capacity
+        x = self.stepper(x, y, h, "max", f"{cap}",
+                         lambda: self.set_capacity(cap - 100), lambda: self.set_capacity(cap + 100))
+        x = self.stepper(x, y, h, "brush", f"{self.brush:.0f}",
+                         lambda: self.set_brush(self.brush / 1.25), lambda: self.set_brush(self.brush * 1.25))
+        x += 4
+        x = self.button(x, y, 52, h, "rain", self.rain)
+        self.button(x, y, 52, h, "clear", self.clear_plants)
+
+    def button(self, x, y, w, h, label, action, active=False, color=ACCENT):
+        r = pygame.Rect(x, y, w, h)
+        hover = r.collidepoint(pygame.mouse.get_pos())
+        pygame.draw.rect(self.screen, color if active else ((64, 78, 104) if hover else (36, 44, 62)), r, border_radius=5)
+        txt = self.font.render(label, True, (15, 20, 30) if active else TEXT)
+        self.screen.blit(txt, txt.get_rect(center=r.center))
+        self.buttons.append((r, action))
+        return x + w + 4
+
+    def stepper(self, x, y, h, label, value, dec, inc):
+        """ラベル [-] 値 [+]"""
+        t = self.font.render(label, True, DIM)
+        self.screen.blit(t, (x, y + (h - t.get_height()) // 2))
+        x += t.get_width() + 5
+        x = self.button(x, y, 22, h, "-", dec)
+        v = self.font.render(value, True, TEXT)
+        self.screen.blit(v, v.get_rect(center=(x + 21, y + h // 2)))
+        x = self.button(x + 44, y, 22, h, "+", inc)
+        return x + 8
 
     def draw_sensor(self, i):
         p, info, c = self.pack, self.info, self.cfg
@@ -538,7 +714,7 @@ class Viewer:
         self.text(f"carnivores {s.get('carnivores', 0):4d}", color=CARN_COL, x=172)
         self.text(f"plants {s['food']}  corpses {s['meat']}  kills {s['kills']:,}")
         self.text(f"gen max {s.get('gen_max', 0)} (mean {s.get('gen_mean', 0):.0f})  families {s.get('lineages', 0)}")
-        self.text(f"births {s['births']:,}  deaths {s['deaths']:,}  rescued {s['injected']}", color=DIM)
+        self.text(f"births {s['births']:,}  deaths {s['deaths']:,}  spawned {s['spawned']}", color=DIM)
         self.y += 4
         self.draw_graph()
         self.y += 6
@@ -554,9 +730,9 @@ class Viewer:
             self.draw_fin_map()
         yy = VIEW_H - 76
         for line in ("SPACE pause   +/- speed   wheel zoom",
-                     "right-drag / arrows: move camera",
-                     "click select   F follow   C camera",
-                     "R food rain   H hotspots   S save"):
+                     "right-drag move  F follow  C camera",
+                     "1-5 tool  [ ] brush  < > plant growth",
+                     "R rain   H hotspots   S save"):
             self.screen.blit(self.font.render(line, True, DIM), (x0 + 14, yy))
             yy += 18
         if self.message_t > 0:
@@ -737,9 +913,12 @@ class Viewer:
             if move.any():
                 self.cam += move * pan
                 self.follow = False
+            if self.painting:
+                self.apply_brush()
             self.advance()
             self.refresh()
             self.draw_world()
+            self.draw_toolbar()
             self.draw_panel()
             pygame.display.flip()
             self.frame += 1
